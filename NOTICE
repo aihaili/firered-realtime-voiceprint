@@ -1,0 +1,20 @@
+FireRed 实时语音转写（firered-realtime-voiceprint）
+Copyright 2026 aihaili
+https://github.com/aihaili/firered-realtime-voiceprint
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+本仓库与之集成但不内嵌的上游作品，各自遵循其许可证：
+
+  - FireRedASR2S (Apache-2.0)
+    https://github.com/FireRedTeam/FireRedASR2S
+    提供 ASR（FireRedASR2-AED）、标点（FireRedPunc）、VAD、LID
+
+  - FunASR / ModelScope campplus 说话人验证模型 (Apache-2.0)
+    https://github.com/modelscope/FunASR
+    模型：iic/speech_campplus_sv_zh-cn_16k-common
+
+  - faster-whisper (MIT) —— 仅 tools/bench_asr_ab.py 的对照实验可选使用
+    https://github.com/SYSTRAN/faster-whisper
+
+本仓库不包含任何音频、声纹数据或转录文本。
