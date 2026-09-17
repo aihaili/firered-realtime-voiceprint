@@ -1,0 +1,29 @@
+# 语音/声纹数据：绝不要提交（隐私 + 生物特征）
+*.wav
+*.flac
+*.pcm
+*.mp3
+*.ogg
+speakers*.json
+*.hf_token
+.hf_token
+
+# 日志
+*.log
+
+# 模型与官方源码（按 README 自行 clone / 下载）
+FireRedASR2S/
+pretrained_models/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器/系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+dist/

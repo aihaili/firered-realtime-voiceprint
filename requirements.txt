@@ -1,0 +1,17 @@
+# 本机实测可用版本（Windows 11 + Python 3.12 + RTX 3090）
+# 说明：FireRedASR2S 官方仓库要求 torch==2.1.0+cu118 / numpy==1.26.1，
+# 但实测 torch 2.8.0+cu128 + numpy 2.x 也能跑通（本项目的 CUDA Graph 方案基于该组合）。
+torch>=2.4
+torchaudio>=2.4
+transformers>=4.51.3
+numpy
+soundfile
+kaldiio
+kaldi_native_fbank
+sentencepiece
+modelscope
+fastapi
+uvicorn
+websockets
+# 可选：声纹/标点以外的对照实验
+# faster-whisper
