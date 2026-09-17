@@ -5,8 +5,14 @@
 *.mp3
 *.ogg
 speakers*.json
-*.hf_token
+
+# 凭据：绝不提交
 .hf_token
+*.hf_token
+.gh_token
+*.gh_token
+*token*.txt
+.env
 
 # 日志
 *.log
