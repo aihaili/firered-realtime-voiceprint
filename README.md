@@ -52,6 +52,19 @@
 - NVIDIA GPU（实测 RTX 3090 24G；fp16 下模型仅占 2.2G，8G 卡也够）
 - 国内网络建议用 ModelScope 下模型（见下）
 
+### 1. 取本仓库 + 官方源码与模型
+
+```bash
+git clone https://github.com/aihaili/firered-realtime-voiceprint.git
+cd firered-realtime-voiceprint
+
+# 官方 ASR 源码（本仓库与它同级放置，见步骤 3）
+git clone https://github.com/FireRedTeam/FireRedASR2S.git
+cd FireRedASR2S
+```
+
+再回到本节下方继续下模型。
+
 ### 1. 取官方源码与模型
 
 ```bash
