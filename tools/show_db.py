@@ -4,7 +4,7 @@ import json
 import os
 import sys
 
-path = sys.argv[1] if len(sys.argv) > 1 else "speakers_firered.json"
+path = sys.argv[1] if len(sys.argv) > 1 else r"E:\WhisperX\speakers_firered.json"
 d = json.load(open(path, encoding="utf-8"))
 s = d["speakers"]
 print(f"{path}: {len(s)} speakers")
