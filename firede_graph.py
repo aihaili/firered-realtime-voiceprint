@@ -65,9 +65,15 @@ class _StepGraph:
         self.step_in = torch.zeros(1, dtype=torch.long, device=device)
         self.tok_in = torch.zeros(self.NB, 1, dtype=torch.long, device=device)
         self.ys_buf = torch.zeros(self.NB, CAP, dtype=torch.long, device=device)
-        self.scores = z(self.NB, 1)
-        self.conf = z(self.NB, CAP)
+        # ⚠️ scores/conf 必须 fp32：官方 batch_beam_search 的 scores 是 .float()（fp32），
+        # 每步累加 fp16 的 t_topB_scores 时自动提升为 fp32。若用 fp16 累加，
+        # 分数在 |s|≈20~30 处 ulp≈0.016，50 步随机游走误差可达 ~0.05，
+        # 足以翻转 beam topk 的接近比分 → 轨迹漂移 → 在循环吸引子音频上塌缩。
+        self.scores = torch.zeros(self.NB, 1, device=device, dtype=torch.float32)
+        self.conf = torch.zeros(self.NB, CAP, device=device, dtype=torch.float32)
         self.is_fin = z(self.NB, 1)
+        # 调试缓冲：每步的 t_scores 分布（供逐步 diff 定位数值分歧），52KB 可忽略
+        self.t_scores_buf = z(self.NB, dec.tgt_word_emb.num_embeddings)
         self.fin_mask = torch.tensor([0.0] + [neg] * (B - 1), device=device,
                                      dtype=dtype).view(1, B).repeat(self.NB, 1)
         self.stride = (B * torch.arange(1, device=device)).view(1, 1).repeat(1, B).reshape(self.NB)
@@ -90,7 +96,11 @@ class _StepGraph:
         self.tok_in.fill_(self.dec.sos_id)
         self.ys_buf.zero_()
         self.ys_buf[:, 0] = self.dec.sos_id
-        self.scores.copy_(self.fin_mask[:, :1])     # 官方初值: [0, -INF, -INF, ...] 每个 beam 一行
+        # 官方初值: scores = [0, -INF, -INF]（N=1 时仅 beam0 存活，其余 -INF）。
+        # 注意取 fin_mask 的**第一行**（[0, neg, neg]）：若误取第一列 fin_mask[:, :1]
+        # 会得到 [0, 0, 0] → 三个 beam 从第 0 步起历史/分数全同 → topk 永远选中同一
+        # token → beam 搜索永久退化为贪心解码，在低质量音频上直接循环塌缩。
+        self.scores.copy_(self.fin_mask[0].view(self.NB, 1))
         self.conf.zero_()
         self.is_fin.zero_()
 
@@ -143,6 +153,7 @@ class _StepGraph:
         t_scores = torch.log_softmax(logits / softmax_smoothing, dim=-1)
         if eos_penalty != 1.0:
             t_scores[:, dec.eos_id] = t_scores[:, dec.eos_id] * eos_penalty
+        self.t_scores_buf.copy_(t_scores)
 
         t_top_scores, t_top_ys = torch.topk(t_scores, k=B, dim=1)          # (NB,B)
         # finished 的 beam：分数归零 / 强制 EOS（与官方 set_finished_* 等价）
@@ -165,7 +176,8 @@ class _StepGraph:
         t_ys = torch.gather(t_top_ys.reshape(1, B * B), 1, ids).reshape(self.NB, 1)
         self.ys_buf.index_copy_(1, (t + 1).view(1), t_ys)
         t_cf = torch.gather(t_top_scores.reshape(1, B * B), 1, ids).reshape(self.NB, 1)
-        self.conf.index_copy_(1, (t + 1).view(1), torch.exp(t_cf))
+        # 官方: t_confidences = exp(fp16) 后 cat 进 fp32 confidences（值仍是 fp16 量化）
+        self.conf.index_copy_(1, (t + 1).view(1), torch.exp(t_cf).float())
 
         self.is_fin.copy_(t_ys.eq(dec.eos_id).float())
         self.tok_in.copy_(t_ys)
@@ -294,8 +306,10 @@ class GraphBeamSearch:
         g = self._get_graph(Ti_b)
         g.set_cross(eo, ck, cv, Ti)
         cfg = self.aed.config
-        max_steps = (cfg.decode_max_len if cfg.decode_max_len > 0
-                     else min(int(getattr(self.aed, "output_length_max", CAP - 1)), CAP - 1))
+        # 与官方 batch_beam_search 对齐: maxlen = decode_max_len 或 Ti（实际编码器帧数），
+        # 而不是固定 CAP-1（319 步比官方的 Ti≈25×秒数 宽松，会放大循环空间）
+        max_steps = cfg.decode_max_len if cfg.decode_max_len > 0 else Ti
+        max_steps = min(max_steps, CAP - 1)
         ys, scores, conf, steps = g.run(max_steps, self.check_every)
 
         # ---- 收尾：与官方 batch_beam_search 尾段 + asr.py 完全对齐 ----

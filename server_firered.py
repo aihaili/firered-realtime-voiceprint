@@ -16,6 +16,7 @@ Usage:
     端口 8766（FIRERED_PORT 可覆盖）
 """
 import asyncio
+import gc
 import json
 import os
 import re
@@ -72,7 +73,10 @@ FRAME_SAMPLES = int(FRAME_SEC * SAMPLE_RATE)
 SPEECH_RMS = 0.012
 SILENCE_RMS = 0.006
 SILENCE_END_SEC = 0.7
-MAX_SENT_SEC = 20.0
+# 句子长度上限：AED 编码器开销随长度二次增长，13~20s 长句会 ① 显存暴涨（encoder
+# 激活 + 缓存池不释放）② 束搜索解码器重复塌缩（同一短语反复输出）。10s 上限内实测
+# 全部干净（12s 以下无塌缩），长独白会被强制切成 ≤10s 的连续气泡。
+MAX_SENT_SEC = float(os.environ.get("FIRERED_MAX_SENT_SEC", "10.0"))
 PRE_PAD_SEC = 0.4
 LIVE_POLL_SEC = 1.2
 MIN_LIVE_SEC = float(os.environ.get("FIRERED_MIN_LIVE_SEC", "0.8"))  # 置很大可关闭 live 预览
@@ -122,7 +126,11 @@ VOICE_MIN_SEG_SEC = float(os.environ.get("FIRERED_VOICE_MIN_SEG_SEC", "1.2"))
 MIN_EMBED_SEC = 0.6     # 计算声纹的最短音频
 PENDING_SPLIT_PAUSE = 0.2     # 挂起分段：出现 0.2s 静音即切
 PENDING_SPLIT_MAX_SEC = 10.0  # 挂起分段兜底：10s 无停顿强制切
-SV_MODEL_NAME = "iic/speech_campplus_sv_zh-cn_16k-common"
+# 声纹嵌入模型：ERes2NetV2（3D-Speaker，192 维）。在本机 6 通电话实测中
+# 关键段声纹对分离度 +0.084、EER 1.1%，优于 campplus（+0.061）。
+# 可用环境变量回退：FIRERED_SV_MODEL=iic/speech_campplus_sv_zh-cn_16k-common
+SV_MODEL_NAME = os.environ.get(
+    "FIRERED_SV_MODEL", "iic/speech_eres2netv2_sv_zh-cn_16k-common")
 SPEAKERS_FILE = os.environ.get("FIRERED_DB") or os.path.join(BASE, "speakers_firered.json")
 LEGACY_SPEAKERS_FILE = os.path.join(BASE, "speakers.json")
 SPK_COLORS = ["#07c160", "#1989fa", "#ff9800", "#e91e63", "#9c27b0", "#00bcd4", "#ff5722", "#607d8b"]
@@ -130,7 +138,7 @@ SPK_COLORS = ["#07c160", "#1989fa", "#ff9800", "#e91e63", "#9c27b0", "#00bcd4", 
 app = FastAPI()
 asr_model = None        # FireRedASR2-AED
 punc_model = None       # FireRedPunc
-sv_model = None         # campplus 声纹 pipeline
+sv_model = None         # 声纹 pipeline（ERes2NetV2 / campplus，192 维）
 clients: dict[int, dict] = {}
 
 # ---- 声纹库（内存）----
@@ -187,6 +195,21 @@ def transcribe_live(audio: np.ndarray, sent_sec: float) -> str:
     return transcribe_text(audio)
 
 
+def _release_vram() -> None:
+    """释放 torch 缓存分配器持有的显存（每次推理后调用，避免空闲显存虚高）。
+
+    torch 的 caching allocator 会保留推理峰值期间分配的所有块；不显式
+    empty_cache() 的话，推理后这些块会一直占着显存。这里在每次推理后
+    清空缓存 + 强制 GC，把空闲显存还给系统。
+    """
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+    except Exception as e:
+        print(f"[vram] release error: {e}", flush=True)
+
+
 def transcribe_text(audio: np.ndarray) -> str:
     """AED 转写（live 预览用），返回原始文本。"""
     if asr_model is None:
@@ -198,6 +221,7 @@ def transcribe_text(audio: np.ndarray) -> str:
         return ""
     if not results:
         return ""
+    _release_vram()
     return (results[0].get("text") or "").strip()
 
 
@@ -219,6 +243,7 @@ def transcribe_text_ctc(audio: np.ndarray) -> str:
             out.append(i)
         prev = i
     text = asr_model.tokenizer.detokenize(out)
+    _release_vram()
     return re.sub(r"(<blank>)|(<sil>)", "", text).lower().strip()
 
 
@@ -242,6 +267,7 @@ def transcribe_words(audio: np.ndarray) -> tuple[str, list]:
               f"free={_free/2**30:.2f}G", flush=True)
     if not results:
         return "", []
+    _release_vram()
     r = results[0]
     text = (r.get("text") or "").strip()
     words: list = []
@@ -269,7 +295,7 @@ def restore_punct(text: str) -> str:
 
 # ===================== 声纹 =====================
 def speaker_embed(audio: np.ndarray) -> np.ndarray | None:
-    """campplus 192 维 L2 归一化嵌入。"""
+    """192 维 L2 归一化声纹嵌入（ERes2NetV2 / campplus）。"""
     if sv_model is None:
         return None
     r = sv_model([audio], output_emb=True)
@@ -365,8 +391,13 @@ def assign_speaker(emb: np.ndarray, text: str | None = None, force_update: bool 
         print(f"[sv] absorb into {sid} (sim={sim:.3f} >= MERGE_THR={MERGE_THR})", flush=True)
         return sid
     sid = _next_spk_id()
+    # 默认标签 speaker01/02/...：匿名但稳定，UI 直接显示，用户可随时改名
+    try:
+        _disp = f"speaker{int(sid.split('_')[1]):02d}"
+    except Exception:
+        _disp = sid
     speaker_db[sid] = {
-        "name": "", "embeddings": [emb.tolist()], "centroid": emb.copy(),
+        "name": _disp, "embeddings": [emb.tolist()], "centroid": emb.copy(),
         "samples": [], "color": _next_color(), "created": time.time(),
     }
     if text:
@@ -623,8 +654,15 @@ def save_speaker_db():
 def speaker_list() -> list:
     out = []
     for sid, sp in speaker_db.items():
+        name = sp["name"]
+        if not name:
+            # 旧条目无默认名 → 补 speakerNN 风格显示名（不改库，仅展示）
+            try:
+                name = f"speaker{int(sid.split('_')[1]):02d}"
+            except Exception:
+                name = sid
         out.append({
-            "id": sid, "name": sp["name"], "color": sp["color"],
+            "id": sid, "name": name, "color": sp["color"],
             "count": len(sp["embeddings"]), "samples": sp["samples"][-3:],
         })
     out.sort(key=lambda x: x["id"])
@@ -772,11 +810,23 @@ def finalize_session(segs: list, audio: np.ndarray, win_cache: dict | None = Non
             cl_spk.append(None)
             continue
         sample = segs[cl[0]].get("text", "")[:40]
+        dur = sum(segs[k]["s1"] - segs[k]["s0"] for k in cl) / SAMPLE_RATE
+        if dur < MIN_NEW_SPK_SEC and speaker_db:
+            # 短簇（<2s）：嵌入噪声大、易低于阈值 → 新建即碎片（实测 1.3s「我操」
+            # sim=0.557 被误建成 spk_6）。不新建，直接归最佳匹配（词级窗口仍按
+            # 质心分配，真·第二人由 B 阶段"未解释窗口"路径兜底挖出）。
+            sid, sim = match_speaker(cents[ci])
+            if verbose:
+                print(f"[finalize] 说话人簇#{ci}: {len(cl)} 段 {dur:.1f}s 短簇 → "
+                      f"归 {sid} (sim={sim:.3f})  「{sample}」", flush=True)
+            cl_spk.append(sid)
+            if sid:
+                used.add(sid)
+            continue
         sid = assign_speaker(cents[ci], sample, force_update=True)
         cl_spk.append(sid)
         used.add(sid)
         if verbose:
-            dur = sum(segs[k]["s1"] - segs[k]["s0"] for k in cl) / SAMPLE_RATE
             print(f"[finalize] 说话人簇#{ci}: {len(cl)} 段 {dur:.1f}s → {sid}  「{sample}」",
                   flush=True)
 
@@ -1477,7 +1527,7 @@ async def main():
     # graph: CUDA Graph 解码（最快，~4x；极少数句子 beam 打平时与官方差 1~2 字）
     # fast : 等价增量解码（~1.5x，与官方逐字一致）
     # official: 官方原版（基准）
-    mode = os.environ.get("FIRERED_DECODE", "graph").lower()
+    mode = os.environ.get("FIRERED_DECODE", "fast").lower()
     if mode in ("graph", "fast"):
         try:
             import firede_fast
